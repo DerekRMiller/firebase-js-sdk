@@ -17,6 +17,7 @@
 
 import { expect } from 'chai';
 
+import { User } from '../../../src/auth/user';
 import { SnapshotVersion } from '../../../src/core/snapshot_version';
 import { IndexedDbPersistence } from '../../../src/local/indexeddb_persistence';
 import { remoteDocumentCacheGetLastReadTime } from '../../../src/local/indexeddb_remote_document_cache';
@@ -49,7 +50,13 @@ describe('MemoryRemoteDocumentCache', () => {
   beforeEach(() => {
     cache = persistenceHelpers
       .testMemoryEagerPersistence()
-      .then(persistence => new TestRemoteDocumentCache(persistence));
+      .then(persistence => {
+        const remoteDocuments = new TestRemoteDocumentCache(persistence);
+        remoteDocuments.setIndexManager(
+          persistence.getIndexManager(User.UNAUTHENTICATED)
+        );
+        return remoteDocuments;
+      });
   });
 
   genericRemoteDocumentCacheTests(() => cache);
@@ -61,9 +68,13 @@ describe('LRU MemoryRemoteDocumentCache', () => {
   let cache: Promise<TestRemoteDocumentCache>;
 
   beforeEach(async () => {
-    cache = persistenceHelpers
-      .testMemoryLruPersistence()
-      .then(persistence => new TestRemoteDocumentCache(persistence));
+    cache = persistenceHelpers.testMemoryLruPersistence().then(persistence => {
+      const remoteDocuments = new TestRemoteDocumentCache(persistence);
+      remoteDocuments.setIndexManager(
+        persistence.getIndexManager(User.UNAUTHENTICATED)
+      );
+      return remoteDocuments;
+    });
   });
 
   genericRemoteDocumentCacheTests(() => cache);
@@ -84,6 +95,7 @@ describe.only('IndexedDbRemoteDocumentCache', () => {
       synchronizeTabs: true
     });
     cache = new TestRemoteDocumentCache(persistence);
+    cache.setIndexManager(persistence.getIndexManager(User.UNAUTHENTICATED));
   });
 
   afterEach(async () => {
@@ -357,7 +369,7 @@ function genericRemoteDocumentCacheTests(
       doc('c/1', VERSION, DOC_DATA)
     ]);
 
-    const matchingDocs = await cache.getAll(path('b'), SnapshotVersion.min());
+    const matchingDocs = await cache.getAllFromCollection(path('b'), SnapshotVersion.min());
     assertMatches(
       [doc('b/1', VERSION, DOC_DATA), doc('b/2', VERSION, DOC_DATA)],
       matchingDocs
@@ -375,7 +387,7 @@ function genericRemoteDocumentCacheTests(
       doc('b/new', 3, DOC_DATA).setReadTime(version(13))
     ]);
 
-    const matchingDocs = await cache.getAll(
+    const matchingDocs = await cache.getAllFromCollection(
       path('b'),
       /* sinceReadTime= */ version(12)
     );
@@ -386,7 +398,7 @@ function genericRemoteDocumentCacheTests(
     await cache.addEntries([doc('b/old', 1, DOC_DATA).setReadTime(version(2))]);
     await cache.addEntries([doc('b/new', 2, DOC_DATA).setReadTime(version(1))]);
 
-    const matchingDocs = await cache.getAll(
+    const matchingDocs = await cache.getAllFromCollection(
       path('b'),
       /* sinceReadTime= */ version(1)
     );
@@ -422,7 +434,7 @@ function genericRemoteDocumentCacheTests(
     document.data.set(field('state'), wrap('new'));
 
     document = await cache
-      .getAll(path('coll'), SnapshotVersion.min())
+      .getAllFromCollection(path('coll'), SnapshotVersion.min())
       .then(m => m.get(key('coll/doc'))!);
     verifyOldValue(document);
 

@@ -15,41 +15,108 @@
  * limitations under the License.
  */
 
-import { Target } from '../core/target';
+import { User } from '../auth/user';
+import {
+  Bound,
+  canonifyTarget,
+  FieldFilter,
+  Operator,
+  Target,
+  targetEquals,
+  targetGetArrayValues,
+  targetGetLowerBound,
+  targetGetNotInValues,
+  targetGetUpperBound
+} from '../core/target';
+import { FirestoreIndexValueWriter } from '../index/firestore_index_value_writer';
+import { IndexByteEncoder } from '../index/index_byte_encoder';
+import { IndexEntry, indexEntryComparator } from '../index/index_entry';
 import {
   documentKeySet,
   DocumentKeySet,
   DocumentMap
 } from '../model/collections';
-import { FieldIndex, IndexOffset } from '../model/field_index';
-import { ResourcePath } from '../model/path';
+import { Document } from '../model/document';
+import { DocumentKey } from '../model/document_key';
+import {
+  FieldIndex,
+  fieldIndexGetArraySegment,
+  fieldIndexGetDirectionalSegments,
+  fieldIndexToString,
+  IndexKind,
+  IndexOffset,
+  IndexSegment
+} from '../model/field_index';
+import { FieldPath, ResourcePath } from '../model/path';
+import { TargetIndexMatcher } from '../model/target_index_matcher';
+import { isArray } from '../model/values';
+import { Value as ProtoValue } from '../protos/firestore_proto_api';
 import { debugAssert } from '../util/assert';
+import { logDebug } from '../util/log';
 import { immediateSuccessor } from '../util/misc';
+import { ObjectMap } from '../util/obj_map';
+import { diffSortedSets, SortedSet } from '../util/sorted_set';
 
 import {
   decodeResourcePath,
   encodeResourcePath
 } from './encoded_resource_path';
 import { IndexManager } from './index_manager';
-import { DbCollectionParent, DbCollectionParentKey } from './indexeddb_schema';
+import {
+  DbCollectionParent,
+  DbCollectionParentKey,
+  DbIndexConfiguration,
+  DbIndexConfigurationKey,
+  DbIndexEntry,
+  DbIndexEntryKey,
+  DbIndexState,
+  DbIndexStateKey
+} from './indexeddb_schema';
 import { getStore } from './indexeddb_transaction';
+import {
+  fromDbIndexConfiguration,
+  toDbIndexConfiguration,
+  toDbIndexState
+} from './local_serializer';
 import { MemoryCollectionParentIndex } from './memory_index_manager';
 import { PersistencePromise } from './persistence_promise';
 import { PersistenceTransaction } from './persistence_transaction';
 import { SimpleDbStore } from './simple_db';
 
+const LOG_TAG = 'IndexedDbIndexManager';
+
+const EMPTY_VALUE = new Uint8Array(0);
+
 /**
  * A persisted implementation of IndexManager.
+ *
+ * PORTING NOTE: Unlike iOS and Android, the Web SDK does not memoize index
+ * data as it supports multi-tab access.
  */
 export class IndexedDbIndexManager implements IndexManager {
   /**
    * An in-memory copy of the index entries we've already written since the SDK
    * launched. Used to avoid re-writing the same entry repeatedly.
    *
-   * This is *NOT* a complete cache of what's in persistence and so can never be used to
-   * satisfy reads.
+   * This is *NOT* a complete cache of what's in persistence and so can never be
+   * used to satisfy reads.
    */
   private collectionParentsCache = new MemoryCollectionParentIndex();
+
+  private uid: string;
+
+  /**
+   * Maps from a target to its equivalent list of sub-targets. Each sub-target
+   * contains only one term from the target's disjunctive normal form (DNF).
+   */
+  private targetToDnfSubTargets = new ObjectMap<Target, Target[]>(
+    t => canonifyTarget(t),
+    (l, r) => targetEquals(l, r)
+  );
+
+  constructor(private user: User) {
+    this.uid = user.uid || '';
+  }
 
   /**
    * Adds a new entry to the collection parent index.
@@ -114,48 +181,442 @@ export class IndexedDbIndexManager implements IndexManager {
     transaction: PersistenceTransaction,
     index: FieldIndex
   ): PersistencePromise<void> {
-    // TODO(indexing): Implement
-    return PersistencePromise.resolve();
+    // TODO(indexing): Verify that the auto-incrementing index ID works in
+    // Safari & Firefox.
+    const indexes = indexConfigurationStore(transaction);
+    const dbIndex = toDbIndexConfiguration(index);
+    delete dbIndex.indexId; // `indexId` is auto-populated by IndexedDb
+    return indexes.add(dbIndex).next();
   }
 
   deleteFieldIndex(
     transaction: PersistenceTransaction,
     index: FieldIndex
   ): PersistencePromise<void> {
-    // TODO(indexing): Implement
-    return PersistencePromise.resolve();
+    const indexes = indexConfigurationStore(transaction);
+    const states = indexStateStore(transaction);
+    const entries = indexEntriesStore(transaction);
+    return indexes
+      .delete(index.indexId)
+      .next(() =>
+        states.delete(
+          IDBKeyRange.bound(
+            [index.indexId],
+            [index.indexId + 1],
+            /*lowerOpen=*/ false,
+            /*upperOpen=*/ true
+          )
+        )
+      )
+      .next(() =>
+        entries.delete(
+          IDBKeyRange.bound(
+            [index.indexId],
+            [index.indexId + 1],
+            /*lowerOpen=*/ false,
+            /*upperOpen=*/ true
+          )
+        )
+      );
   }
 
   getDocumentsMatchingTarget(
     transaction: PersistenceTransaction,
-    fieldIndex: FieldIndex,
     target: Target
-  ): PersistencePromise<DocumentKeySet> {
-    // TODO(indexing): Implement
-    return PersistencePromise.resolve(documentKeySet());
+  ): PersistencePromise<DocumentKeySet | null> {
+    const indexEntries = indexEntriesStore(transaction);
+
+    let canServeTarget = true;
+    const indexes = new Map<Target, FieldIndex | null>();
+
+    return PersistencePromise.forEach(
+      this.getSubTargets(target),
+      (subTarget: Target) => {
+        return this.getFieldIndex(transaction, subTarget).next(index => {
+          canServeTarget &&= !!index;
+          indexes.set(subTarget, index);
+        });
+      }
+    ).next(() => {
+      if (!canServeTarget) {
+        return PersistencePromise.resolve(null as DocumentKeySet | null);
+      } else {
+        let result = documentKeySet();
+        return PersistencePromise.forEach(indexes, (index, subTarget) => {
+          logDebug(
+            LOG_TAG,
+            `Using index ${fieldIndexToString(
+              index!
+            )} to execute ${canonifyTarget(target)}`
+          );
+
+          const arrayValues = targetGetArrayValues(subTarget, index!);
+          const notInValues = targetGetNotInValues(subTarget, index!);
+          const lowerBound = targetGetLowerBound(subTarget, index!);
+          const upperBound = targetGetUpperBound(subTarget, index!);
+
+          const lowerBoundEncoded = this.encodeBound(
+            index!,
+            subTarget,
+            lowerBound
+          );
+          const upperBoundEncoded = this.encodeBound(
+            index!,
+            subTarget,
+            upperBound
+          );
+          const notInEncoded = this.encodeValues(
+            index!,
+            subTarget,
+            notInValues
+          );
+
+          const indexRanges = this.generateIndexRanges(
+            index!.indexId,
+            arrayValues,
+            lowerBoundEncoded,
+            !!lowerBound && lowerBound.inclusive,
+            upperBoundEncoded,
+            !!upperBound && upperBound.inclusive,
+            notInEncoded
+          );
+          return PersistencePromise.forEach(
+            indexRanges,
+            (indexRange: IDBKeyRange) => {
+              return indexEntries
+                .loadFirst(indexRange, target.limit)
+                .next(entries => {
+                  entries.forEach(entry => {
+                    result = result.add(
+                      new DocumentKey(decodeResourcePath(entry.documentKey))
+                    );
+                  });
+                });
+            }
+          );
+        }).next(() => result as DocumentKeySet | null);
+      }
+    });
+  }
+
+  private getSubTargets(target: Target): Target[] {
+    let subTargets = this.targetToDnfSubTargets.get(target);
+    if (subTargets) {
+      return subTargets;
+    }
+    // TODO(orquery): Implement DNF transform
+    subTargets = [target];
+    this.targetToDnfSubTargets.set(target, subTargets);
+    return subTargets;
+  }
+
+  /**
+   * Constructs a key range query on `DbIndexEntry.store` that unions all
+   * bounds.
+   */
+  private generateIndexRanges(
+    indexId: number,
+    arrayValues: ProtoValue[] | null,
+    lowerBounds: Uint8Array[] | null,
+    lowerBoundInclusive: boolean,
+    upperBounds: Uint8Array[] | null,
+    upperBoundInclusive: boolean,
+    notInValues: Uint8Array[]
+  ): IDBKeyRange[] {
+    // The number of total index scans we union together. This is similar to a
+    // distributed normal form, but adapted for array values. We create a single
+    // index range per value in an ARRAY_CONTAINS or ARRAY_CONTAINS_ANY filter
+    // combined with the values from the query bounds.
+    const totalScans =
+      (arrayValues != null ? arrayValues.length : 1) *
+      Math.max(
+        lowerBounds != null ? lowerBounds.length : 1,
+        upperBounds != null ? upperBounds.length : 1
+      );
+    const scansPerArrayElement =
+      totalScans / (arrayValues != null ? arrayValues.length : 1);
+
+    const indexRanges: IDBKeyRange[] = [];
+    for (let i = 0; i < totalScans; ++i) {
+      const arrayValue = arrayValues
+        ? this.encodeSingleElement(arrayValues[i / scansPerArrayElement])
+        : EMPTY_VALUE;
+
+      const lowerBound = lowerBounds
+        ? this.generateLowerBound(
+            indexId,
+            arrayValue,
+            lowerBounds[i % scansPerArrayElement],
+            lowerBoundInclusive
+          )
+        : this.generateEmptyBound(indexId);
+      const upperBound = upperBounds
+        ? this.generateUpperBound(
+            indexId,
+            arrayValue,
+            upperBounds[i % scansPerArrayElement],
+            upperBoundInclusive
+          )
+        : this.generateEmptyBound(indexId + 1);
+
+      indexRanges.push(
+        ...this.createRange(
+          lowerBound,
+          upperBound,
+          notInValues.map(
+            (
+              notIn // make non-nullable
+            ) =>
+              this.generateLowerBound(
+                indexId,
+                arrayValue,
+                notIn,
+                /* inclusive= */ true
+              )
+          )
+        )
+      );
+    }
+
+    return indexRanges;
+  }
+
+  /** Generates the lower bound for `arrayValue` and `directionalValue`. */
+  private generateLowerBound(
+    indexId: number,
+    arrayValue: Uint8Array,
+    directionalValue: Uint8Array,
+    inclusive: boolean
+  ): IndexEntry {
+    const entry = new IndexEntry(
+      indexId,
+      DocumentKey.empty(),
+      arrayValue,
+      directionalValue
+    );
+    return inclusive ? entry : entry.successor();
+  }
+
+  /** Generates the upper bound for `arrayValue` and `directionalValue`. */
+  private generateUpperBound(
+    indexId: number,
+    arrayValue: Uint8Array,
+    directionalValue: Uint8Array,
+    inclusive: boolean
+  ): IndexEntry {
+    const entry = new IndexEntry(
+      indexId,
+      DocumentKey.empty(),
+      arrayValue,
+      directionalValue
+    );
+    return inclusive ? entry.successor() : entry;
+  }
+
+  /**
+   * Generates an empty bound that scopes the index scan to the current index
+   * and user.
+   */
+  private generateEmptyBound(indexId: number): IndexEntry {
+    return new IndexEntry(
+      indexId,
+      DocumentKey.empty(),
+      EMPTY_VALUE,
+      EMPTY_VALUE
+    );
   }
 
   getFieldIndex(
     transaction: PersistenceTransaction,
     target: Target
   ): PersistencePromise<FieldIndex | null> {
-    // TODO(indexing): Implement
-    return PersistencePromise.resolve<FieldIndex | null>(null);
+    const targetIndexMatcher = new TargetIndexMatcher(target);
+    const collectionGroup =
+      target.collectionGroup != null
+        ? target.collectionGroup
+        : target.path.lastSegment();
+
+    return this.getFieldIndexes(transaction, collectionGroup).next(indexes => {
+      const matchingIndexes = indexes.filter(i =>
+        targetIndexMatcher.servedByIndex(i)
+      );
+
+      // Return the index that matches the most number of segments.
+      matchingIndexes.sort((l, r) => r.fields.length - l.fields.length);
+      return matchingIndexes.length > 0 ? matchingIndexes[0] : null;
+    });
+  }
+
+  /**
+   * Returns the byte encoded form of the directional values in the field index.
+   * Returns `null` if the document does not have all fields specified in the
+   * index.
+   */
+  private encodeDirectionalElements(
+    fieldIndex: FieldIndex,
+    document: Document
+  ): Uint8Array | null {
+    const encoder = new IndexByteEncoder();
+    for (const segment of fieldIndexGetDirectionalSegments(fieldIndex)) {
+      const field = document.data.field(segment.fieldPath);
+      if (field == null) {
+        return null;
+      }
+      const directionalEncoder = encoder.forKind(segment.kind);
+      FirestoreIndexValueWriter.INSTANCE.writeIndexValue(
+        field,
+        directionalEncoder
+      );
+    }
+    return encoder.encodedBytes();
+  }
+
+  /** Encodes a single value to the ascending index format. */
+  private encodeSingleElement(value: ProtoValue): Uint8Array {
+    const encoder = new IndexByteEncoder();
+    FirestoreIndexValueWriter.INSTANCE.writeIndexValue(
+      value,
+      encoder.forKind(IndexKind.ASCENDING)
+    );
+    return encoder.encodedBytes();
+  }
+
+  /**
+   * Encodes the given field values according to the specification in `target`.
+   * For IN queries, a list of possible values is returned.
+   */
+  private encodeValues(
+    fieldIndex: FieldIndex,
+    target: Target,
+    bound: ProtoValue[] | null
+  ): Uint8Array[] {
+    if (bound === null) {
+      return [];
+    }
+
+    let encoders: IndexByteEncoder[] = [];
+    encoders.push(new IndexByteEncoder());
+
+    let boundIdx = 0;
+    for (const segment of fieldIndexGetDirectionalSegments(fieldIndex)) {
+      const value = bound[boundIdx++];
+      for (const encoder of encoders) {
+        if (this.isInFilter(target, segment.fieldPath) && isArray(value)) {
+          encoders = this.expandIndexValues(encoders, segment, value);
+        } else {
+          const directionalEncoder = encoder.forKind(segment.kind);
+          FirestoreIndexValueWriter.INSTANCE.writeIndexValue(
+            value,
+            directionalEncoder
+          );
+        }
+      }
+    }
+    return this.getEncodedBytes(encoders);
+  }
+
+  /**
+   * Encodes the given bounds according to the specification in `target`. For IN
+   * queries, a list of possible values is returned.
+   */
+  private encodeBound(
+    fieldIndex: FieldIndex,
+    target: Target,
+    bound: Bound | null
+  ): Uint8Array[] | null {
+    if (bound == null) {
+      return null;
+    }
+    return this.encodeValues(fieldIndex, target, bound.position);
+  }
+
+  /** Returns the byte representation for the provided encoders. */
+  private getEncodedBytes(encoders: IndexByteEncoder[]): Uint8Array[] {
+    const result: Uint8Array[] = [];
+    for (let i = 0; i < encoders.length; ++i) {
+      result[i] = encoders[i].encodedBytes();
+    }
+    return result;
+  }
+
+  /**
+   * Creates a separate encoder for each element of an array.
+   *
+   * The method appends each value to all existing encoders (e.g. filter("a",
+   * "==", "a1").filter("b", "in", ["b1", "b2"]) becomes ["a1,b1", "a1,b2"]). A
+   * list of new encoders is returned.
+   */
+  private expandIndexValues(
+    encoders: IndexByteEncoder[],
+    segment: IndexSegment,
+    value: ProtoValue
+  ): IndexByteEncoder[] {
+    const prefixes = [...encoders];
+    const results: IndexByteEncoder[] = [];
+    for (const arrayElement of value.arrayValue!.values || []) {
+      for (const prefix of prefixes) {
+        const clonedEncoder = new IndexByteEncoder();
+        clonedEncoder.seed(prefix.encodedBytes());
+        FirestoreIndexValueWriter.INSTANCE.writeIndexValue(
+          arrayElement,
+          clonedEncoder.forKind(segment.kind)
+        );
+        results.push(clonedEncoder);
+      }
+    }
+    return results;
+  }
+
+  private isInFilter(target: Target, fieldPath: FieldPath): boolean {
+    return !!target.filters.find(
+      f =>
+        f instanceof FieldFilter &&
+        f.field.isEqual(fieldPath) &&
+        (f.op === Operator.IN || f.op === Operator.NOT_IN)
+    );
   }
 
   getFieldIndexes(
     transaction: PersistenceTransaction,
     collectionGroup?: string
   ): PersistencePromise<FieldIndex[]> {
-    // TODO(indexing): Implement
-    return PersistencePromise.resolve<FieldIndex[]>([]);
+    const indexes = indexConfigurationStore(transaction);
+    const states = indexStateStore(transaction);
+
+    return (
+      collectionGroup
+        ? indexes.loadAll(
+            DbIndexConfiguration.collectionGroupIndex,
+            IDBKeyRange.bound(collectionGroup, collectionGroup)
+          )
+        : indexes.loadAll()
+    ).next(indexConfigs => {
+      const result: FieldIndex[] = [];
+      return PersistencePromise.forEach(
+        indexConfigs,
+        (indexConfig: DbIndexConfiguration) => {
+          return states
+            .get([indexConfig.indexId!, this.uid])
+            .next(indexState => {
+              result.push(fromDbIndexConfiguration(indexConfig, indexState));
+            });
+        }
+      ).next(() => result);
+    });
   }
 
   getNextCollectionGroupToUpdate(
     transaction: PersistenceTransaction
   ): PersistencePromise<string | null> {
-    // TODO(indexing): Implement
-    return PersistencePromise.resolve<string | null>(null);
+    return this.getFieldIndexes(transaction).next(indexes => {
+      if (indexes.length === 0) {
+        return null;
+      }
+      indexes.sort(
+        (l, r) => l.indexState.sequenceNumber - r.indexState.sequenceNumber
+      );
+      return indexes[0].collectionGroup;
+    });
   }
 
   updateCollectionGroup(
@@ -163,16 +624,291 @@ export class IndexedDbIndexManager implements IndexManager {
     collectionGroup: string,
     offset: IndexOffset
   ): PersistencePromise<void> {
-    // TODO(indexing): Implement
-    return PersistencePromise.resolve();
+    const indexes = indexConfigurationStore(transaction);
+    const states = indexStateStore(transaction);
+    return this.getNextSequenceNumber(transaction).next(nextSequenceNumber =>
+      indexes
+        .loadAll(
+          DbIndexConfiguration.collectionGroupIndex,
+          IDBKeyRange.bound(collectionGroup, collectionGroup)
+        )
+        .next(configs =>
+          PersistencePromise.forEach(configs, (config: DbIndexConfiguration) =>
+            states.put(
+              toDbIndexState(
+                config.indexId!,
+                this.user,
+                nextSequenceNumber,
+                offset
+              )
+            )
+          )
+        )
+    );
   }
 
   updateIndexEntries(
     transaction: PersistenceTransaction,
     documents: DocumentMap
   ): PersistencePromise<void> {
-    // TODO(indexing): Implement
-    return PersistencePromise.resolve();
+    // Porting Note: `getFieldIndexes()` on Web does not cache index lookups as
+    // it could be used across different IndexedDB transactions. As any cached
+    // data might be invalidated by other multi-tab clients, we can only trust
+    // data within a single IndexedDB transaction. We therefore add a cache
+    // here.
+    const memoizedIndexes = new Map<string, FieldIndex[]>();
+    return PersistencePromise.forEach(documents, (key, doc) => {
+      const memoizedCollectionIndexes = memoizedIndexes.get(
+        key.collectionGroup
+      );
+      const fieldIndexes = memoizedCollectionIndexes
+        ? PersistencePromise.resolve(memoizedCollectionIndexes)
+        : this.getFieldIndexes(transaction, key.collectionGroup);
+
+      return fieldIndexes.next(fieldIndexes => {
+        memoizedIndexes.set(key.collectionGroup, fieldIndexes);
+        return PersistencePromise.forEach(
+          fieldIndexes,
+          (fieldIndex: FieldIndex) => {
+            return this.getExistingIndexEntries(
+              transaction,
+              key,
+              fieldIndex
+            ).next(existingEntries => {
+              const newEntries = this.computeIndexEntries(doc, fieldIndex);
+              if (!existingEntries.isEqual(newEntries)) {
+                return this.updateEntries(
+                  transaction,
+                  doc,
+                  existingEntries,
+                  newEntries
+                );
+              }
+              return PersistencePromise.resolve();
+            });
+          }
+        );
+      });
+    });
+  }
+
+  private addIndexEntry(
+    transaction: PersistenceTransaction,
+    document: Document,
+    indexEntry: IndexEntry
+  ): PersistencePromise<void> {
+    const indexEntries = indexEntriesStore(transaction);
+    return indexEntries.put(
+      new DbIndexEntry(
+        indexEntry.indexId,
+        this.uid,
+        indexEntry.arrayValue,
+        indexEntry.directionalValue,
+        encodeResourcePath(document.key.path)
+      )
+    );
+  }
+
+  private deleteIndexEntry(
+    transaction: PersistenceTransaction,
+    document: Document,
+    indexEntry: IndexEntry
+  ): PersistencePromise<void> {
+    const indexEntries = indexEntriesStore(transaction);
+    return indexEntries.delete([
+      indexEntry.indexId,
+      this.uid,
+      indexEntry.arrayValue,
+      indexEntry.directionalValue,
+      encodeResourcePath(document.key.path)
+    ]);
+  }
+
+  private getExistingIndexEntries(
+    transaction: PersistenceTransaction,
+    documentKey: DocumentKey,
+    fieldIndex: FieldIndex
+  ): PersistencePromise<SortedSet<IndexEntry>> {
+    const indexEntries = indexEntriesStore(transaction);
+    let results = new SortedSet<IndexEntry>(indexEntryComparator);
+    return indexEntries
+      .iterate(
+        {
+          index: DbIndexEntry.documentKeyIndex,
+          range: IDBKeyRange.only([
+            fieldIndex.indexId,
+            this.uid,
+            encodeResourcePath(documentKey.path)
+          ])
+        },
+        (_, entry) => {
+          results = results.add(
+            new IndexEntry(
+              fieldIndex.indexId,
+              documentKey,
+              entry.arrayValue,
+              entry.directionalValue
+            )
+          );
+        }
+      )
+      .next(() => results);
+  }
+
+  /** Creates the index entries for the given document. */
+  private computeIndexEntries(
+    document: Document,
+    fieldIndex: FieldIndex
+  ): SortedSet<IndexEntry> {
+    let results = new SortedSet<IndexEntry>(indexEntryComparator);
+
+    const directionalValue = this.encodeDirectionalElements(
+      fieldIndex,
+      document
+    );
+    if (directionalValue == null) {
+      return results;
+    }
+
+    const arraySegment = fieldIndexGetArraySegment(fieldIndex);
+    if (arraySegment != null) {
+      const value = document.data.field(arraySegment.fieldPath);
+      if (isArray(value)) {
+        for (const arrayValue of value.arrayValue!.values || []) {
+          results = results.add(
+            new IndexEntry(
+              fieldIndex.indexId,
+              document.key,
+              this.encodeSingleElement(arrayValue),
+              directionalValue
+            )
+          );
+        }
+      }
+    } else {
+      results = results.add(
+        new IndexEntry(
+          fieldIndex.indexId,
+          document.key,
+          EMPTY_VALUE,
+          directionalValue
+        )
+      );
+    }
+
+    return results;
+  }
+
+  /**
+   * Updates the index entries for the provided document by deleting entries
+   * that are no longer referenced in `newEntries` and adding all newly added
+   * entries.
+   */
+  private updateEntries(
+    transaction: PersistenceTransaction,
+    document: Document,
+    existingEntries: SortedSet<IndexEntry>,
+    newEntries: SortedSet<IndexEntry>
+  ): PersistencePromise<void> {
+    logDebug(LOG_TAG, "Updating index entries for document '%s'", document.key);
+
+    const promises: Array<PersistencePromise<void>> = [];
+    diffSortedSets(
+      existingEntries,
+      newEntries,
+      indexEntryComparator,
+      /* onAdd= */ entry => {
+        promises.push(this.addIndexEntry(transaction, document, entry));
+      },
+      /* onRemove= */ entry => {
+        promises.push(this.deleteIndexEntry(transaction, document, entry));
+      }
+    );
+
+    return PersistencePromise.waitFor(promises);
+  }
+
+  private getNextSequenceNumber(
+    transaction: PersistenceTransaction
+  ): PersistencePromise<number> {
+    let nextSequenceNumber = 1;
+    const states = indexStateStore(transaction);
+    return states
+      .iterate(
+        {
+          index: DbIndexState.sequenceNumberIndex,
+          reverse: true,
+          range: IDBKeyRange.upperBound([this.uid, Number.MAX_SAFE_INTEGER])
+        },
+        (_, state, controller) => {
+          controller.done();
+          nextSequenceNumber = state.sequenceNumber + 1;
+        }
+      )
+      .next(() => nextSequenceNumber);
+  }
+
+  /**
+   * Returns a new set of IDB ranges that splits the existing range and excludes
+   * any values that match the `notInValue` from these ranges. As an example,
+   * '[foo > 2 && foo != 3]` becomes  `[foo > 2 && < 3, foo > 3]`.
+   */
+  private createRange(
+    lower: IndexEntry,
+    upper: IndexEntry,
+    notInValues: IndexEntry[]
+  ): IDBKeyRange[] {
+    // The notIb values need to be sorted and unique so that we can return a
+    // sorted set of non-overlapping ranges.
+    notInValues = notInValues
+      .sort((l, r) => indexEntryComparator(l, r))
+      .filter(
+        (el, i, values) => !i || indexEntryComparator(el, values[i - 1]) !== 0
+      );
+
+    const bounds: IndexEntry[] = [];
+    bounds.push(lower);
+    for (const notInValue of notInValues) {
+      const cmpToLower = indexEntryComparator(notInValue, lower);
+      const cmpToUpper = indexEntryComparator(notInValue, upper);
+
+      if (cmpToLower === 0) {
+        // `notInValue` is the lower bound. We therefore need to raise the bound
+        // to the next value.
+        bounds[0] = lower.successor();
+      } else if (cmpToLower > 0 && cmpToUpper < 0) {
+        // `notInValue` is in the middle of the range
+        bounds.push(notInValue);
+        bounds.push(notInValue.successor());
+      } else if (cmpToUpper > 0) {
+        // `notInValue` (and all following values) are out of the range
+        break;
+      }
+    }
+    bounds.push(upper);
+
+    const ranges: IDBKeyRange[] = [];
+    for (let i = 0; i < bounds.length; i += 2) {
+      ranges.push(
+        IDBKeyRange.bound(
+          [
+            bounds[i].indexId,
+            this.uid,
+            bounds[i].arrayValue,
+            bounds[i].directionalValue,
+            ''
+          ],
+          [
+            bounds[i + 1].indexId,
+            this.uid,
+            bounds[i + 1].arrayValue,
+            bounds[i + 1].directionalValue,
+            ''
+          ]
+        )
+      );
+    }
+    return ranges;
   }
 }
 
@@ -187,4 +923,34 @@ function collectionParentsStore(
     txn,
     DbCollectionParent.store
   );
+}
+
+/**
+ * Helper to get a typed SimpleDbStore for the index entry object store.
+ */
+function indexEntriesStore(
+  txn: PersistenceTransaction
+): SimpleDbStore<DbIndexEntryKey, DbIndexEntry> {
+  return getStore<DbIndexEntryKey, DbIndexEntry>(txn, DbIndexEntry.store);
+}
+
+/**
+ * Helper to get a typed SimpleDbStore for the index configuration object store.
+ */
+function indexConfigurationStore(
+  txn: PersistenceTransaction
+): SimpleDbStore<DbIndexConfigurationKey, DbIndexConfiguration> {
+  return getStore<DbIndexConfigurationKey, DbIndexConfiguration>(
+    txn,
+    DbIndexConfiguration.store
+  );
+}
+
+/**
+ * Helper to get a typed SimpleDbStore for the index state object store.
+ */
+function indexStateStore(
+  txn: PersistenceTransaction
+): SimpleDbStore<DbIndexStateKey, DbIndexState> {
+  return getStore<DbIndexStateKey, DbIndexState>(txn, DbIndexState.store);
 }

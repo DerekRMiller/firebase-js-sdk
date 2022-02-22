@@ -21,6 +21,7 @@ import { MutableDocument } from '../model/document';
 import { DocumentKey } from '../model/document_key';
 import { ResourcePath } from '../model/path';
 
+import { IndexManager } from './index_manager';
 import { PersistencePromise } from './persistence_promise';
 import { PersistenceTransaction } from './persistence_transaction';
 import { RemoteDocumentChangeBuffer } from './remote_document_change_buffer';
@@ -34,6 +35,9 @@ import { IndexOffset } from '../model/field_index';
  * documents that are known to not exist.
  */
 export interface RemoteDocumentCache {
+  /** Sets the index manager to use for managing the collectionGroup index. */
+  setIndexManager(indexManager: IndexManager): void;
+
   /**
    * Looks up an entry in the cache.
    *
@@ -62,8 +66,7 @@ export interface RemoteDocumentCache {
    * Returns the documents from the provided collection.
    *
    * @param collection - The collection to read.
-   * @param sinceReadTime - The read time and document key to start scanning at
-   * (exclusive).
+   * @param offset - The offset to start the scan at (exclusive).
    * @returns The set of matching documents.
    */
   getAllFromCollection(

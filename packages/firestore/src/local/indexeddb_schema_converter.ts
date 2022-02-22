@@ -36,8 +36,9 @@ import {
   DbDocumentMutation,
   DbDocumentMutationKey,
   DbIndexConfiguration,
-  DbIndexEntries,
+  DbIndexEntry,
   DbIndexState,
+  DbDocumentOverlay,
   DbMutationBatch,
   DbMutationBatchKey,
   DbMutationQueue,
@@ -174,6 +175,12 @@ export class SchemaConverter implements SimpleDbSchemaConverter {
     }
 
     if (fromVersion < 12 && toVersion >= 12) {
+      p = p.next(() => {
+        createDocumentOverlayStore(db);
+      });
+    }
+
+    if (fromVersion < 13 && toVersion >= 13) {
       p = p.next(() => {
         createFieldIndex(db);
       });
@@ -456,13 +463,50 @@ function createNamedQueriesStore(db: IDBDatabase): void {
 }
 
 function createFieldIndex(db: IDBDatabase): void {
-  db.createObjectStore(DbIndexConfiguration.store, {
-    keyPath: DbIndexConfiguration.keyPath
-  });
-  db.createObjectStore(DbIndexState.store, {
+  const indexConfiguratioStore = db.createObjectStore(
+    DbIndexConfiguration.store,
+    {
+      keyPath: DbIndexConfiguration.keyPath,
+      autoIncrement: true
+    }
+  );
+  indexConfiguratioStore.createIndex(
+    DbIndexConfiguration.collectionGroupIndex,
+    DbIndexConfiguration.collectionGroupIndexPath,
+    { unique: false }
+  );
+
+  const indexStateStore = db.createObjectStore(DbIndexState.store, {
     keyPath: DbIndexState.keyPath
   });
-  db.createObjectStore(DbIndexEntries.store, {
-    keyPath: DbIndexEntries.keyPath
+  indexStateStore.createIndex(
+    DbIndexState.sequenceNumberIndex,
+    DbIndexState.sequenceNumberIndexPath,
+    { unique: false }
+  );
+
+  const indexEntryStore = db.createObjectStore(DbIndexEntry.store, {
+    keyPath: DbIndexEntry.keyPath
   });
+  indexEntryStore.createIndex(
+    DbIndexEntry.documentKeyIndex,
+    DbIndexEntry.documentKeyIndexPath,
+    { unique: false }
+  );
+}
+
+function createDocumentOverlayStore(db: IDBDatabase): void {
+  const documentOverlayStore = db.createObjectStore(DbDocumentOverlay.store, {
+    keyPath: DbDocumentOverlay.keyPath
+  });
+  documentOverlayStore.createIndex(
+    DbDocumentOverlay.collectionPathOverlayIndex,
+    DbDocumentOverlay.collectionPathOverlayIndexPath,
+    { unique: false }
+  );
+  documentOverlayStore.createIndex(
+    DbDocumentOverlay.collectionGroupOverlayIndex,
+    DbDocumentOverlay.collectionGroupOverlayIndexPath,
+    { unique: false }
+  );
 }

@@ -25,7 +25,7 @@ import {
   QueryTarget as ProtoQueryTarget,
   Write as ProtoWrite
 } from '../protos/firestore_proto_api';
-import { debugAssert } from '../util/assert';
+import { debugAssert, fail } from '../util/assert';
 
 import {
   EncodedResourcePath,
@@ -35,7 +35,7 @@ import {
 // TODO(indexing): Remove this constant
 const INDEXING_ENABLED = false;
 
-export const INDEXING_SCHEMA_VERSION = 12;
+export const INDEXING_SCHEMA_VERSION = 13;
 
 /**
  * Schema Version for the Web client:
@@ -55,9 +55,11 @@ export const INDEXING_SCHEMA_VERSION = 12;
  *     an auto-incrementing ID. This is required for Index-Free queries.
  * 10. Rewrite the canonical IDs to the explicit Protobuf-based format.
  * 11. Add bundles and named_queries for bundle support.
- * 12. Add indexing support.
+ * 12. Add document overlays.
+ * 13. Add indexing support.
  */
-export const SCHEMA_VERSION = INDEXING_ENABLED ? INDEXING_SCHEMA_VERSION : 11;
+
+export const SCHEMA_VERSION = INDEXING_ENABLED ? INDEXING_SCHEMA_VERSION : 12;
 
 /**
  * Wrapper class to store timestamps (seconds and nanos) in IndexedDb objects.
@@ -714,13 +716,28 @@ export class DbIndexConfiguration {
 
   static keyPath = 'indexId';
 
+  /**
+   * An index that provides access to the index configurations by collection
+   * group.
+   *
+   * PORTING NOTE: iOS and Android maintain this index in-memory, but this is
+   * not possible here as the Web client supports concurrent access to
+   * persistence via multi-tab.
+   */
+  static collectionGroupIndex = 'collectionGroupIndex';
+
+  static collectionGroupIndexPath = 'collectionGroup';
+
   constructor(
-    /** The index id for this entry. */
-    public indexId: number,
+    /**
+     * The index id for this entry. Undefined for indexes that are not yet
+     * persisted.
+     */
+    public indexId: number | undefined,
     /** The collection group this index belongs to. */
     public collectionGroup: string,
     /** The fields to index for this index. */
-    public fields: [[name: string, kind: IndexKind]]
+    public fields: Array<[name: string, kind: IndexKind]>
   ) {}
 }
 
@@ -736,6 +753,18 @@ export class DbIndexState {
   static store = 'indexState';
 
   static keyPath = ['indexId', 'uid'];
+
+  /**
+   * An index that provides access to documents in a collection sorted by last
+   * update time. Used by the backfiller.
+   *
+   * PORTING NOTE: iOS and Android maintain this index in-memory, but this is
+   * not possible here as the Web client supports concurrent access to
+   * persistence via multi-tab.
+   */
+  static sequenceNumberIndex = 'sequenceNumberIndex';
+
+  static sequenceNumberIndexPath = ['uid', 'sequenceNumber'];
 
   constructor(
     /** The index id for this entry. */
@@ -773,7 +802,7 @@ export class DbIndexState {
 export type DbIndexEntryKey = [number, string, Uint8Array, Uint8Array, string];
 
 /** An object that stores the encoded entries for all documents and fields. */
-export class DbIndexEntries {
+export class DbIndexEntry {
   /** Name of the IndexedDb object store. */
   static store = 'indexEntries';
 
@@ -784,6 +813,10 @@ export class DbIndexEntries {
     'directionalValue',
     'documentKey'
   ];
+
+  static documentKeyIndex = 'documentKeyIndex';
+
+  static documentKeyIndexPath = ['indexId', 'uid', 'documentKey'];
 
   constructor(
     /** The index id for this entry. */
@@ -796,6 +829,51 @@ export class DbIndexEntries {
     public directionalValue: Uint8Array,
     /** The document key this entry points to. */
     public documentKey: EncodedResourcePath
+  ) {}
+}
+
+export type DbDocumentOverlayKey = [
+  /* userId */ string,
+  /* collectionPath */ string,
+  /* documentId */ string
+];
+
+/**
+ * An object representing a document overlay.
+ */
+export class DbDocumentOverlay {
+  /** Name of the IndexedDb object store. */
+  static store = 'documentOverlays';
+
+  static keyPath = ['userId', 'collectionPath', 'documentId'];
+
+  static collectionPathOverlayIndex = 'collectionPathOverlayIndex';
+  static collectionPathOverlayIndexPath = [
+    'userId',
+    'collectionPath',
+    'largestBatchId'
+  ];
+
+  static collectionGroupOverlayIndex = 'collectionGroupOverlayIndex';
+  static collectionGroupOverlayIndexPath = [
+    'userId',
+    'collectionGroup',
+    'largestBatchId'
+  ];
+
+  constructor(
+    /** The user ID to whom this overlay belongs. */
+    public userId: string,
+    /** The path to the collection that contains the document. */
+    public collectionPath: string,
+    /** The ID (key) of the document within the collection. */
+    public documentId: string,
+    /** The collection group to which the document belongs. */
+    public collectionGroup: string,
+    /** The largest batch ID that's been applied for this overlay. */
+    public largestBatchId: number,
+    /** The overlay mutation. */
+    public overlayMutation: ProtoWrite
   ) {}
 }
 
@@ -833,11 +911,13 @@ export const V8_STORES = [...V6_STORES, DbCollectionParent.store];
 
 export const V11_STORES = [...V8_STORES, DbBundle.store, DbNamedQuery.store];
 
-export const V12_STORES = [
-  ...V11_STORES,
+export const V12_STORES = [...V11_STORES, DbDocumentOverlay.store];
+
+export const V13_STORES = [
+  ...V12_STORES,
   DbIndexConfiguration.store,
   DbIndexState.store,
-  DbIndexEntries.store
+  DbIndexEntry.store
 ];
 
 /**
@@ -845,4 +925,17 @@ export const V12_STORES = [
  * used when creating transactions so that access across all stores is done
  * atomically.
  */
-export const ALL_STORES = V11_STORES;
+export const ALL_STORES = V12_STORES;
+
+/** Returns the object stores for the provided schema. */
+export function getObjectStores(schemaVersion: number): string[] {
+  if (schemaVersion === 13) {
+    return V13_STORES;
+  } else if (schemaVersion === 12) {
+    return V12_STORES;
+  } else if (schemaVersion === 11) {
+    return V11_STORES;
+  } else {
+    fail('Only schema version 11 and 12 and 13 are supported');
+  }
+}

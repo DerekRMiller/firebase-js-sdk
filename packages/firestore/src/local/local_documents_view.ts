@@ -41,6 +41,7 @@ import { MutationQueue } from './mutation_queue';
 import { PersistencePromise } from './persistence_promise';
 import { PersistenceTransaction } from './persistence_transaction';
 import { RemoteDocumentCache } from './remote_document_cache';
+import {IndexOffset} from "../model/field_index";
 
 /**
  * A readonly view of the local state of all documents we're tracking (i.e. we
@@ -212,12 +213,12 @@ export class LocalDocumentsView {
   private getDocumentsMatchingCollectionQuery(
     transaction: PersistenceTransaction,
     query: Query,
-    sinceReadTime: SnapshotVersion
+    offset: IndexOffset
   ): PersistencePromise<DocumentMap> {
     // Query the remote documents and overlay mutations.
     let results: MutableDocumentMap;
     return this.remoteDocumentCache
-      .getAllFromCollection(transaction, query.path, sinceReadTime)
+      .getAllFromCollection(transaction, query.path, offset)
       .next(queryResults => {
         results = queryResults;
         return this.mutationQueue.getAllMutationBatchesAffectingQuery(

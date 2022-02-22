@@ -17,6 +17,7 @@
 
 import { Query } from '../../../src/core/query';
 import { SnapshotVersion } from '../../../src/core/snapshot_version';
+import { IndexManager } from '../../../src/local/index_manager';
 import { LocalDocumentsView } from '../../../src/local/local_documents_view';
 import { MutationQueue } from '../../../src/local/mutation_queue';
 import { PersistencePromise } from '../../../src/local/persistence_promise';
@@ -92,9 +93,20 @@ export class CountingQueryEngine extends QueryEngine {
     subject: RemoteDocumentCache
   ): RemoteDocumentCache {
     return {
-      getAll: (transaction, collectionGroup, sinceReadTime) => {
+      setIndexManager: (indexManager: IndexManager) => {
+        subject.setIndexManager(indexManager);
+      },
+      getAllFromCollection: (transaction, collection, sinceReadTime) => {
         return subject
-          .getAllFromCollection(transaction, collectionGroup, sinceReadTime)
+          .getAllFromCollection(transaction, collection, sinceReadTime)
+          .next(result => {
+            this.documentsReadByCollection += result.size;
+            return result;
+          });
+      },
+      getAllFromCollectionGroup: (transaction, collectionGroup, sinceReadTime, limit) => {
+        return subject
+          .getAllFromCollectionGroup(transaction, collectionGroup, sinceReadTime, limit)
           .next(result => {
             this.documentsReadByCollection += result.size;
             return result;

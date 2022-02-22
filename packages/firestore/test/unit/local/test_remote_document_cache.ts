@@ -16,6 +16,7 @@
  */
 
 import { SnapshotVersion } from '../../../src/core/snapshot_version';
+import { IndexManager } from '../../../src/local/index_manager';
 import { remoteDocumentCacheGetNewDocumentChanges } from '../../../src/local/indexeddb_remote_document_cache';
 import { Persistence } from '../../../src/local/persistence';
 import { PersistencePromise } from '../../../src/local/persistence_promise';
@@ -28,6 +29,7 @@ import {
 import { Document, MutableDocument } from '../../../src/model/document';
 import { DocumentKey } from '../../../src/model/document_key';
 import { ResourcePath } from '../../../src/model/path';
+import {IndexOffset} from "../../../src/model/field_index";
 
 /**
  * A wrapper around a RemoteDocumentCache that automatically creates a
@@ -38,6 +40,10 @@ export class TestRemoteDocumentCache {
 
   constructor(private readonly persistence: Persistence) {
     this.cache = persistence.getRemoteDocumentCache();
+  }
+
+  setIndexManager(indexManager: IndexManager): void {
+    this.cache.setIndexManager(indexManager);
   }
 
   /**
@@ -104,14 +110,14 @@ export class TestRemoteDocumentCache {
     });
   }
 
-  getAll(
+  getAllFromCollection(
     collection: ResourcePath,
-    sinceReadTime: SnapshotVersion
+    offset: IndexOffset
   ): Promise<MutableDocumentMap> {
     return this.persistence.runTransaction(
       'getDocumentsMatchingQuery',
       'readonly',
-      txn => this.cache.getAllFromCollection(txn, collection, sinceReadTime)
+      txn => this.cache.getAllFromCollection(txn, collection, offset)
     );
   }
 
